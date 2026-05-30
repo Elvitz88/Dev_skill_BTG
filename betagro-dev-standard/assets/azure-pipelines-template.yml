@@ -1,0 +1,197 @@
+# azure-pipelines-template.yml — Betagro standard starter
+# มาตรฐาน pipeline ของ Betagro: CodeQuality -> Build -> Update(GitOps)
+# NOTE: verify every tool/library is on the GT&D-approved list before committing.
+#
+# Real-project patterns incorporated from btg-labware-auth-service (2026-05-30):
+#   - deploymentFileName variable (required to target the correct K8s deployment YAML)
+#   - Fix Script Line Endings step (guards against CRLF from Windows-edited updateK8smanifest.sh)
+#   - 5-arg call to updateK8smanifest.sh (adds deploymentFileName as 5th arg)
+
+trigger:
+  - dev       # change to your environment branch (dev / qa / uat / main)
+
+variables:
+  # --- Registry & image ---
+  containerRegistryConection: 'app-nonprod-registry'          # Azure DevOps service connection name
+  imageName: '<your-image-name>'                              # e.g. btg-labware-auth-service
+  GCP_PROJECT_ID: 'app-nonprod-project'
+  GCP_REPO: 'app-nonprod-ar'
+  containerImageRepository: 'asia-southeast1-docker.pkg.dev/$(GCP_PROJECT_ID)/$(GCP_REPO)/$(imageName)'
+
+  # --- Environment ---
+  environment: 'dev'                                          # dev | qa | uat | prod
+  pool: 'GCP-NONPRD-POOL'                                     # self-hosted agent pool
+
+  # --- GitOps ---
+  updateK8sScriptFile: 'updateK8smanifest.sh'
+  k8sManifestRepoUrl: 'git@ssh.dev.azure.com:v3/betagro-dev/<project>/<manifest-repo>'
+  # REQUIRED: name of the deployment YAML file to patch in the manifest repo
+  # e.g. authservicedev-deployment.yaml — must match the file in your GitOps manifest repo
+  deploymentFileName: '<service>-<env>-deployment.yaml'
+
+stages:
+  # ─────────────────────────────────────────────────────────────
+  # Stage 1: CodeQuality — knip dead-code analysis
+  # ─────────────────────────────────────────────────────────────
+  - stage: CodeQuality
+    displayName: 'Code Quality & Knip'
+    dependsOn: []   # run in parallel with nothing (first stage)
+    jobs:
+      - job: KnipCheck
+        displayName: 'Run Knip Analysis'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+            displayName: 'Checkout source code'
+
+          - task: NodeTool@0
+            displayName: 'Install Node.js'
+            inputs:
+              versionSpec: '22.x'
+
+          - script: npm install
+            displayName: 'Install dependencies'
+
+          - script: |
+              mkdir -p knip-results
+              KNIP_OUTPUT_FILE="knip-results/knip-report.txt"
+              KNIP_SUMMARY_FILE="knip-results/summary.md"
+              KNIP_STATUS_FILE="knip-results/status.txt"
+
+              npm run knip > "$KNIP_OUTPUT_FILE" 2>&1 || true
+
+              echo "## Knip Analysis Results" > "$KNIP_SUMMARY_FILE"
+              echo "" >> "$KNIP_SUMMARY_FILE"
+
+              KNIP_ISSUES_FOUND=0
+              if [ -f "$KNIP_OUTPUT_FILE" ]; then
+                if grep -qE "\([1-9][0-9]*\)$" "$KNIP_OUTPUT_FILE"; then
+                  ISSUE_COUNT=$(grep -oE "\(([0-9]+)\)$" "$KNIP_OUTPUT_FILE" | grep -oE "[0-9]+" | awk '{sum+=$1} END {print sum+0}')
+                  if [ "$ISSUE_COUNT" -gt 0 ]; then
+                    KNIP_ISSUES_FOUND=$ISSUE_COUNT
+                  fi
+                fi
+              fi
+
+              if [ "$KNIP_ISSUES_FOUND" -eq 0 ]; then
+                echo "No issues found." >> "$KNIP_SUMMARY_FILE"
+                echo "PASS" > "$KNIP_STATUS_FILE"
+                exit 0
+              else
+                echo "Found $KNIP_ISSUES_FOUND potential issue(s)." >> "$KNIP_SUMMARY_FILE"
+                echo "ISSUES_FOUND" > "$KNIP_STATUS_FILE"
+                exit 1
+              fi
+            displayName: 'Run Knip Checks'
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Knip Results'
+            inputs:
+              pathToPublish: 'knip-results'
+              artifactName: 'knip-results'
+              publishLocation: 'Container'
+            condition: always()
+
+  # ─────────────────────────────────────────────────────────────
+  # Stage 2: Build — Docker build + push to GCP Artifact Registry
+  # ─────────────────────────────────────────────────────────────
+  - stage: Build
+    displayName: 'Build & Push Docker Image'
+    dependsOn: []   # runs in parallel with CodeQuality; change to [CodeQuality] to enforce order
+    condition: succeeded()
+    jobs:
+      - job: Build
+        displayName: 'Build Job'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          # Extract short (8-char) commit hash for immutable image tag
+          - script: |
+              echo "Source Version: $(Build.SourceVersion)"
+              commitHash=$(echo "$(Build.SourceVersion)" | cut -c1-8)
+              echo "Commit Hash (8-digit): $commitHash"
+              echo "##vso[task.setvariable variable=commitHash]$commitHash"
+            displayName: 'Get Git Commit Hash (8-digit)'
+
+          - task: Docker@2
+            displayName: 'Build Docker Image'
+            inputs:
+              containerRegistry: '$(containerRegistryConection)'
+              repository: '$(GCP_PROJECT_ID)/$(GCP_REPO)/$(imageName)'
+              command: 'build'
+              Dockerfile: '**/Dockerfile'
+              tags: |
+                $(environment)-latest
+                $(environment)-$(Build.SourceVersion)
+              arguments: '--build-arg="GIT_COMMIT_SHA=$(commitHash)"'
+
+          - task: Docker@2
+            displayName: 'Push Docker Image ($(environment)-latest)'
+            inputs:
+              containerRegistry: '$(containerRegistryConection)'
+              repository: '$(GCP_PROJECT_ID)/$(GCP_REPO)/$(imageName)'
+              command: 'push'
+              tags: $(environment)-latest
+
+          - task: Docker@2
+            displayName: 'Push Docker Image ($(environment)-$(Build.SourceVersion))'
+            inputs:
+              containerRegistry: '$(containerRegistryConection)'
+              repository: '$(GCP_PROJECT_ID)/$(GCP_REPO)/$(imageName)'
+              command: 'push'
+              tags: $(environment)-$(Build.SourceVersion)
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Build Artifacts'
+            inputs:
+              pathToPublish: '$(Build.ArtifactStagingDirectory)'
+              artifactName: 'drop'
+
+  # ─────────────────────────────────────────────────────────────
+  # Stage 3: Update — GitOps manifest update (Argo CD syncs)
+  # ─────────────────────────────────────────────────────────────
+  - stage: Update
+    displayName: 'Update K8s Manifests'
+    dependsOn: Build
+    condition: succeeded()
+    jobs:
+      - job: UpdateManifests
+        displayName: 'Update K8s Manifests'
+        pool:
+          name: $(pool)   # must run on self-hosted pool with Git SSH access to manifest repo
+        steps:
+          - checkout: self
+            displayName: 'Checkout source code'
+
+          # GOTCHA: updateK8smanifest.sh may have CRLF line endings if edited on Windows.
+          # This step removes \r and ensures the script is executable before running it.
+          # (Observed in real projects — do not remove this step.)
+          - task: Bash@3
+            displayName: 'Fix Script Line Endings (CRLF → LF)'
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "Fixing line endings in $(updateK8sScriptFile)..."
+                sed -i 's/\r$//' $(System.DefaultWorkingDirectory)/$(updateK8sScriptFile)
+                chmod +x $(System.DefaultWorkingDirectory)/$(updateK8sScriptFile)
+                echo "Verifying..."
+                file $(System.DefaultWorkingDirectory)/$(updateK8sScriptFile)
+                head -3 $(System.DefaultWorkingDirectory)/$(updateK8sScriptFile)
+              workingDirectory: '$(System.DefaultWorkingDirectory)'
+
+          # Args: <env> <image-tag> <container-registry> <manifest-repo-url> <deployment-filename>
+          # 5th arg (deploymentFileName) targets the specific deployment YAML in the manifest repo.
+          - task: Bash@3
+            displayName: 'Update K8s Manifest'
+            inputs:
+              targetType: 'filePath'
+              filePath: '$(System.DefaultWorkingDirectory)/$(updateK8sScriptFile)'
+              arguments: '$(environment) $(environment)-$(Build.SourceVersion) $(containerImageRepository) $(k8sManifestRepoUrl) $(deploymentFileName)'
+              workingDirectory: '$(System.DefaultWorkingDirectory)'
+            env:
+              ENVIRONMENT: $(environment)
+              IMAGE_TAG: $(environment)-$(Build.SourceVersion)
+              CONTAINER_REGISTRY: $(containerImageRepository)
+              K8S_MANIFEST_REPO: $(k8sManifestRepoUrl)
+              DEPLOYMENT_FILE_NAME: $(deploymentFileName)
